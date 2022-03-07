@@ -1,6 +1,7 @@
 import torch
 
 config = dict()
+config['build_custom_head'] = True
 config['competition'] = "feedback-prize-2021"
 config['name'] = "Longformer-Baseline"
 config['debug'] = False
@@ -39,15 +40,16 @@ config['scheduler'] = dict(
     gamma = 0.5
 )
 
-config['monitor_metric'] = 'val_f1_score'
-config['mode'] = 'max'
+config['monitor_metric'] = 'val_loss'  # 'val_loss', 'val_f1_score
+config['mode'] = 'min'  # 'min' , 'max
 
-config['train_batch_size'] = 4
+config['train_batch_size'] = 8
 config['valid_batch_size'] = 4
 config['num_workers'] = 4
 config['resume_from_checkpoint'] = None
 
-config['device'] = 'cuda' if torch.cuda.is_available() else 'cpu'
+config['device_num'] = 0
+config['device'] = f"cuda:{config['device_num']}" if torch.cuda.is_available() else 'cpu'
 
 # colab_dir = ""
 # api_path = colab_dir + "kaggle.json"

@@ -9,7 +9,11 @@ def inference(batch, cfg, model, ids_to_labels):
     ids = batch["input_ids"].to(cfg['device'])
     mask = batch["attention_mask"].to(cfg['device'])
     outputs = model(ids, mask=mask)  # return_dict=False by default
-    all_preds = torch.argmax(outputs[0], axis=-1).cpu().numpy() 
+    
+    if cfg['build_custom_head']:
+        all_preds = torch.argmax(outputs, axis=-1).cpu().numpy() 
+    else:
+        all_preds = torch.argmax(outputs[0], axis=-1).cpu().numpy() 
 
     # INTERATE THROUGH EACH TEXT AND GET PRED
     predictions = []

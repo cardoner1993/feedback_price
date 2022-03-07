@@ -1,29 +1,24 @@
 from datetime import datetime
+from email.policy import default
 import os
+import argparse
 
 RUN_KAGGLE = False
 BASE_PATH = '../input' if RUN_KAGGLE else '../data'
 HF_HOME = os.path.join(BASE_PATH, 'py-bigbird-v26', "models")
 os.makedirs(HF_HOME, exist_ok=True)
 
-DEBUG = False
 EXPERIMENT_NAME = "pytorch_longformer"
-TRAIN_MODEL = False
-COMPUTE_VAL_SCORE = True
-BUILD_SUBMISION = False
-
-if COMPUTE_VAL_SCORE or BUILD_SUBMISION:
-    os.environ["CUDA_VISIBLE_DEVICES"]="7" #0,1,2,3 for four gpu
-
 
 # os.environ['TRANSFORMERS_CACHE'] = HF_HOME
-os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+# os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
 from tqdm import tqdm
 from ast import literal_eval
 
 import numpy as np
 import pandas as pd
+import gc
 
 import json
 
@@ -45,7 +40,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Learning
 
 import torchmetrics
 
-from transformers import AutoTokenizer, AutoConfig, get_linear_schedule_with_warmup,  AutoModelForTokenClassification, get_cosine_schedule_with_warmup
+from transformers import AutoTokenizer, AutoConfig, get_linear_schedule_with_warmup,  AutoModelForTokenClassification, get_cosine_schedule_with_warmup, LongformerConfig, LongformerModel, LongformerTokenizerFast
 from torch.optim import Adam, AdamW
 
 from sklearn.model_selection import KFold, train_test_split
@@ -66,24 +61,11 @@ LOAD_MODEL_FROM = None
 
 # if DOWNLOADED_MODEL_PATH is None:
 #     DOWNLOADED_MODEL_PATH = 'model'    
-MODEL_NAME = 'allenai/longformer-base-4096'
+
 LOAD_CONFIG = None # None or path to config
 LABEL_ALL_SUBTOKENS = True
 FOLDS = 1
-BATCH_SIZE = 4 # Same for train and valid
 
-
-train_params = {'batch_size': BATCH_SIZE,
-                'shuffle': True,
-                'num_workers': 4,
-                'pin_memory':True
-                }
-
-test_params = {'batch_size': BATCH_SIZE,
-                'shuffle': False,
-                'num_workers': 4,
-                'pin_memory':True
-                }
 
 def save_config(dict_conf, conf_path, conf_name='config_experiment.json'):
     # Function to save the config for each experiment.
@@ -155,23 +137,50 @@ class LightningFeedBack(LightningModule):
         super(LightningFeedBack, self).__init__()
 
         self.cfg = cfg
-        
-        if not os.path.isfile(os.path.join(HF_HOME, 'pytorch_model.bin')):
-            config_model = AutoConfig.from_pretrained(model_name) 
-            config_model.num_labels = num_classes
-            config_model.save_pretrained(HF_HOME)
+        self.num_labels = num_classes
 
-            self.model = AutoModelForTokenClassification.from_pretrained(model_name, config=config_model)
-            self.model.save_pretrained(HF_HOME)
-        else:
-            config_model = AutoConfig.from_pretrained(os.path.join(HF_HOME, 'config.json')) 
-            self.model = AutoModelForTokenClassification.from_pretrained(os.path.join(HF_HOME, 'pytorch_model.bin'), config=config_model)
-            
+        if self.cfg['build_custom_head']:
+            # Create a head that will be trained for the custom problem.
+            base_path = os.path.join(HF_HOME, 'pretrained_head')
+            if not os.path.isfile(os.path.join(base_path, 'pytorch_model.bin')):
+                config_model = LongformerConfig.from_pretrained(model_name) 
+                config_model.num_labels = self.num_labels
+                config_model.save_pretrained(base_path)
+
+                self.model = LongformerModel.from_pretrained(model_name, config=config_model)
+                self.model.save_pretrained(base_path)
+            else:
+                config_model = AutoConfig.from_pretrained(os.path.join(base_path, 'config.json')) 
+                self.model = LongformerModel.from_pretrained(base_path, config=config_model)
         
+        else:
+            # Continue training the head.
+            base_path = os.path.join(HF_HOME, 'pretrained_base')
+            if not os.path.isfile(os.path.join(base_path, 'pytorch_model.bin')):
+                config_model = AutoConfig.from_pretrained(model_name) 
+                config_model.num_labels = self.num_labels
+                config_model.save_pretrained(base_path)
+
+                self.model = AutoModelForTokenClassification.from_pretrained(model_name, config=config_model)
+                self.model.save_pretrained(os.path.join(base_path, 'pytorch_model.bin'))
+            else:
+                config_model = AutoConfig.from_pretrained(os.path.join(base_path, 'config.json')) 
+                self.model = AutoModelForTokenClassification.from_pretrained(base_path, config=config_model)
+                
+            
         # Warm up wait n epochs
         self.warmup_steps = 0
         # threshold (float) – Threshold for transforming probability or logit predictions to binary (0,1) 
-        self.metric = torchmetrics.F1(num_classes=num_classes)
+        self.metric = torchmetrics.F1(num_classes=self.num_labels)
+
+        self.loss = nn.CrossEntropyLoss()
+        
+        if self.cfg['build_custom_head']:
+            self.linear = nn.Linear(self.cfg['hidden_size'], self.num_labels)
+    
+    def on_epoch_end(self):
+        torch.cuda.empty_cache()
+        gc.collect()
     
     def setup(self, stage=None):
         if stage != "fit":
@@ -184,7 +193,14 @@ class LightningFeedBack(LightningModule):
         self.total_steps = (len(train_dataloader.dataset) // tb_size) // ab_size
 
     def forward(self, ids, mask, b_labels=None):
-        outputs = self.model(input_ids=ids, attention_mask=mask, labels=b_labels, return_dict=False)
+        if self.cfg['build_custom_head']:
+            x = self.model(ids, mask)
+            x = x[0]
+            outputs = self.linear(x)
+        
+        else:
+            outputs = self.model(input_ids=ids, attention_mask=mask, labels=b_labels, return_dict=False)
+        
         return outputs
 
     def on_train_batch_start(self, batch, batch_idx):
@@ -195,21 +211,25 @@ class LightningFeedBack(LightningModule):
         b_input_ids = batch['input_ids']
         b_input_mask = batch['attention_mask']
         b_labels = batch['labels']
-        z = self(b_input_ids, b_input_mask, b_labels)
 
-        loss, logits = z[0], z[1]
+        if self.cfg['build_custom_head']:
+            logits = self(b_input_ids, b_input_mask, b_labels)
+            loss = self.loss(logits.view(-1, self.num_labels), b_labels.view(-1))
+        else:
+            z = self(b_input_ids, b_input_mask, b_labels)
+            loss, logits = z[0], z[1]
 
         flattened_targets = b_labels.view(-1)
-        active_logits = logits.view(-1, self.model.num_labels)
+        active_logits = logits.view(-1, self.num_labels)
         flattened_predictions = torch.argmax(active_logits, axis=1)
         active_accuracy = b_labels.view(-1) != -100
 
         labels = torch.masked_select(flattened_targets, active_accuracy)
         predictions = torch.masked_select(flattened_predictions, active_accuracy)
 
-        self.log('train_f1_score', self.metric(labels.cpu(), predictions.cpu()).item(), prog_bar=True)
+        self.log('train_f1_score', self.metric(labels.cpu(), predictions.cpu()).item(), prog_bar=True, sync_dist=True)
 
-        self.log('train_loss', loss.item(), prog_bar=True)
+        self.log('train_loss', loss.item(), prog_bar=True, sync_dist=True)
         
         return loss
 
@@ -217,21 +237,25 @@ class LightningFeedBack(LightningModule):
         b_input_ids = batch['input_ids']
         b_input_mask = batch['attention_mask']
         b_labels = batch['labels']
-        z = self(b_input_ids, b_input_mask, b_labels)
         
-        val_loss, logits = z[0], z[1]
+        if self.cfg['build_custom_head']:
+            logits = self(b_input_ids, b_input_mask, b_labels)
+            val_loss = self.loss(logits.view(-1, self.num_labels), b_labels.view(-1))
+        else:
+            z = self(b_input_ids, b_input_mask, b_labels)
+            val_loss, logits = z[0], z[1]
 
         flattened_targets = b_labels.view(-1)
-        active_logits = logits.view(-1, self.model.num_labels)
+        active_logits = logits.view(-1, self.num_labels)
         flattened_predictions = torch.argmax(active_logits, axis=1)
         active_accuracy = b_labels.view(-1) != -100
 
         labels = torch.masked_select(flattened_targets, active_accuracy)
         predictions = torch.masked_select(flattened_predictions, active_accuracy)
 
-        self.log('val_f1_score', self.metric(labels.cpu(), predictions.cpu()).item(), prog_bar=True)
+        self.log('val_f1_score', self.metric(labels.cpu(), predictions.cpu()).item(), prog_bar=True, sync_dist=True)
 
-        self.log('val_loss', val_loss.item(), prog_bar=True)
+        self.log('val_loss', val_loss.item(), prog_bar=True, sync_dist=True)
 
         return val_loss
 
@@ -316,10 +340,9 @@ class dataset(Dataset):
 
 
 class FeedbackDataNLP(LightningDataModule):
-    def __init__(self, fold, batch_size, tokenizer, max_length, train_df, valid_df, cfg):
+    def __init__(self, fold, tokenizer, max_length, train_df, valid_df, cfg):
         super().__init__()
         self.fold = fold
-        self.batch_size = batch_size
         self.max_len = max_length
         self.tokenizer = tokenizer
 
@@ -472,13 +495,55 @@ class FeedbackDataNLP(LightningDataModule):
         # return DataLoader(test_data, sampler=test_sampler, **test_params)
         return DataLoader(self.test_set, **test_params)
 
-if __name__ == '__main__':
+
+def is_dir(path):
+    """Check if file is path.
+
+    Args:
+        path (string): path to model
+
+    Raises:
+        ValueError: If path is not valid
+
+    Returns:
+        str: path to model
+    """
+    if not os.path.isdir(path):
+        raise ValueError("The path is not a valid file")
     
-    experiment_id = f"type_{EXPERIMENT_NAME}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    return path
+
+
+if __name__ == '__main__':
+
+    # Parse arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-n', '--name', required=False, help='Name of the experiment to run. If not defined will default to pytorch_longformer and the date', default=None)
+    parser.add_argument('-t', '--train', action='store_true', help='Train Model')
+    parser.add_argument('-v', '--validate', action='store_true', help='Compute Validation Score')
+    parser.add_argument('-m', '--model_path', type=is_dir, help='Compute Validation Score', default=None)
+    parser.add_argument('-dt', '--device_train', required=False, help='Define the cuda device to use', default=None, nargs="+", type=int)
+    parser.add_argument('-dv', '--device_valid', required=False, help='Define the cuda device to use in validation', default=None, type=int)
+
+    args = parser.parse_args()
+
+    if args.train and args.model_path is not None:
+        print("Train set to True and model_path provided. The model path won't take effect")
+
+    TRAIN_MODEL = args.train
+    COMPUTE_VAL_SCORE = args.validate
+    BUILD_SUBMISION = False
+
+    print("TRAIN", TRAIN_MODEL, "VALIDATE", COMPUTE_VAL_SCORE, "BUILD Submision", BUILD_SUBMISION)
+
+    if args.name is not None:
+        EXPERIMENT_NAME = args.name
+    
+    experiment_id = f"{EXPERIMENT_NAME}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     model_path = os.path.join('./output_lightning', experiment_id)
     log_dir = os.path.join("logs", experiment_id)
 
-    checkpoint_pth = './output_lightning/type_pytorch_longformer_20220219_211255/fold_0'
+    checkpoint_pth = os.path.join(model_path, 'fold_0') if TRAIN_MODEL else args.model_path
 
     os.makedirs(model_path, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
@@ -491,18 +556,44 @@ if __name__ == '__main__':
         cfg_copy['logs_path'], cfg_copy['model_path'] = log_dir, [os.path.join(model_path, f'fold_{fold}') for fold in range(FOLDS)]
         save_config(cfg_copy, model_path, conf_name='config_experiment.json')
     
+    if args.device_valid is not None and 'cuda' in cfg['device']:
+        cfg['device'] = f"cuda:{args.device_valid}"
+    
+    if args.device_train is not None and 'cuda' in cfg['device']:
+        device = args.device_train
+    else:
+        device = None
+    
+    train_params = {'batch_size': cfg['train_batch_size'],
+                'shuffle': True,
+                'num_workers': config['num_workers'],
+                'pin_memory':True
+                }
+
+    test_params = {'batch_size': config['valid_batch_size'],
+                'shuffle': False,
+                'num_workers': config['num_workers'],
+                'pin_memory':True
+                }
+
     train_df = pd.read_csv(os.path.join(BASE_PATH, 'feedback-prize-2021', 'train.csv'))
     text_data_df = pd.read_csv(os.path.join(LOAD_TOKENS_FROM, TRAIN_FILE))  # Text text_data_df
         
-    if DEBUG:
+    if cfg['debug']:
         text_data_df = text_data_df.sample(n=100, random_state=1)
         
-
-    if not os.path.isfile(os.path.join(HF_HOME, 'pytorch_model.bin')):
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, add_prefix_space=True)
-        tokenizer.save_pretrained(HF_HOME)
+    if cfg['build_custom_head']:
+        if not os.path.isfile(os.path.join(HF_HOME, 'pytorch_automodel.bin')):
+            tokenizer = LongformerTokenizerFast.from_pretrained(cfg['model_name'], add_prefix_space=True)
+            tokenizer.save_pretrained(os.path.join(HF_HOME, 'pretrained_head'))
+        else:
+            tokenizer = LongformerTokenizerFast.from_pretrained(os.path.join(HF_HOME, 'pretrained_head'), add_prefix_space=True)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(HF_HOME, add_prefix_space=True)
+        if not os.path.isfile(os.path.join(HF_HOME, 'pytorch_model.bin')):
+            tokenizer = AutoTokenizer.from_pretrained(cfg['model_name'], add_prefix_space=True)
+            tokenizer.save_pretrained(os.path.join(HF_HOME, 'pretrained_base'))
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(os.path.join(HF_HOME, 'pretrained_base'), add_prefix_space=True)
 
     # CREATE TRAIN SUBSET AND VALID SUBSET
     text_data_df = text_data_df[['id','text', 'entities']]
@@ -514,6 +605,8 @@ if __name__ == '__main__':
     
     if TRAIN_MODEL:
         for fold in range(FOLDS):
+
+            print(f"Model will train for {cfg['max_epochs']} EPOCHS")
             
             # Save experiment in each fold. If no folds output is in fold 0
             model_fold_path = os.path.join(model_path, f'fold_{fold}')
@@ -532,7 +625,7 @@ if __name__ == '__main__':
             print("TRAIN Dataset: {}".format(train_dataset.shape))
             print("TEST Dataset: {}".format(test_dataset.shape))
 
-            dm = FeedbackDataNLP(fold=fold, tokenizer=tokenizer, batch_size=BATCH_SIZE, max_length=cfg['max_length'], train_df=train_dataset, valid_df=test_dataset, cfg=cfg)
+            dm = FeedbackDataNLP(fold=fold, tokenizer=tokenizer, max_length=cfg['max_length'], train_df=train_dataset, valid_df=test_dataset, cfg=cfg)
             
             lr_monitor = LearningRateMonitor(logging_interval='step')
             
@@ -543,24 +636,31 @@ if __name__ == '__main__':
                 save_top_k=1,
                 mode=cfg['mode'],
             )
+
+            callbacks = [chk_callback, lr_monitor]
+
+            if cfg['early_stopping']:
             
-            es_callback = EarlyStopping(
-                monitor=cfg['monitor_metric'],
-                min_delta=0.001,
-                patience=5,
-                verbose=True,
-                mode=cfg['mode']
-            )
-            model = LightningFeedBack(model_name=MODEL_NAME, cfg=cfg, num_classes=dm.num_labels)
+                es_callback = EarlyStopping(
+                    monitor=cfg['monitor_metric'],
+                    min_delta=0.001,
+                    patience=5,
+                    verbose=True,
+                    mode=cfg['mode']
+                )
+
+                callbacks += [es_callback]
+
+            model = LightningFeedBack(model_name=cfg['model_name'], cfg=cfg, num_classes=dm.num_labels)
 
             tb_logger = pl_loggers.TensorBoardLogger(save_dir=log_dir)
 
             trainer = Trainer(
-                    # devices=[4, 5],  # error with scheduler from transformers if using more than one
-                    devices=[5],
+                    strategy='dp',
+                    devices=[5, 6] if device is None else device,
                     accelerator="gpu",
                     max_epochs=cfg['max_epochs'],
-                    callbacks=[chk_callback, lr_monitor],  # es_callback
+                    callbacks=callbacks,
                     logger=tb_logger,
                     gradient_clip_val=cfg['gradient_clip_val'],
                     accumulate_grad_batches=cfg['accumulate_grad_batches'],
@@ -579,9 +679,9 @@ if __name__ == '__main__':
 
         test_dataset = text_data_df.loc[text_data_df['id'].isin(IDS[valid_idx])].reset_index(drop=True)
 
-        model = LightningFeedBack(model_name=MODEL_NAME, cfg=cfg, num_classes=len(cfg['output_labels']))
+        model = LightningFeedBack(model_name=cfg['model_name'], cfg=cfg, num_classes=len(cfg['output_labels']))
         checkpoint_path = os.path.join(checkpoint_pth, 'model_best.ckpt')
-        model.load_from_checkpoint(checkpoint_path, model_name=MODEL_NAME, cfg=cfg)
+        model.load_from_checkpoint(checkpoint_path, model_name=cfg['model_name'], cfg=cfg, num_classes=len(cfg['output_labels']))
         model.eval()
         model.to(cfg['device'])
         testing_loader = DataLoader(dataset(test_dataset, tokenizer, cfg['max_length'], True,  cfg=cfg), **test_params)
@@ -607,9 +707,9 @@ if __name__ == '__main__':
 
     if BUILD_SUBMISION:
 
-        model = LightningFeedBack(model_name=MODEL_NAME, cfg=cfg, num_classes=len(cfg['output_labels']))
+        model = LightningFeedBack(model_name=cfg['model_name'], cfg=cfg, num_classes=len(cfg['output_labels']))
         checkpoint_path = os.path.join(checkpoint_pth, 'model_best.ckpt')
-        model.load_from_checkpoint(checkpoint_path, model_name=MODEL_NAME, cfg=cfg)
+        model.load_from_checkpoint(checkpoint_path, model_name=cfg['model_name'], cfg=cfg)
         model.eval()
         model.to(cfg['device'])
         
